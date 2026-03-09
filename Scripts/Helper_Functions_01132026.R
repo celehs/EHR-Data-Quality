@@ -77,37 +77,61 @@ clean_ONCE_data <- function(target_code, O2 = TRUE, path_code = NULL, path_nlp =
 
 clean_raw_data <- function(df, date_col = "start_date", id_col = "feature_id") {
   df <- df %>%
-    mutate({{ date_col }} := as.character(.data[[date_col]]))
+    mutate(start_date_chr = as.character(.data[[date_col]]))
   
   bad_dates <- df %>%
-    filter(!str_detect(.data[[date_col]], "^\\d{4}$|^\\d{4}-\\d{2}-\\d{2}$"))
+    filter(!stringr::str_detect(start_date_chr, "^\\d{4}$|^\\d{4}-\\d{2}-\\d{2}$"))
   
   if (nrow(bad_dates) > 0) {
     warning(nrow(bad_dates), " rows have invalid date format in `", date_col, "` and were set to NA.")
   }
   
-  df <- df %>%
+  df %>%
     mutate(
       patient_num = as.character(patient_num),
-      year = case_when(
-        str_detect(.data[[date_col]], "^\\d{4}$") ~ .data[[date_col]],
-        str_detect(.data[[date_col]], "^\\d{4}-\\d{2}-\\d{2}$") ~ as.character(
-          lubridate::year(suppressWarnings(lubridate::ymd(.data[[date_col]])))
+      year = dplyr::case_when(
+        stringr::str_detect(start_date_chr, "^\\d{4}$") ~ start_date_chr,
+        stringr::str_detect(start_date_chr, "^\\d{4}-\\d{2}-\\d{2}$") ~ as.character(
+          lubridate::year(suppressWarnings(lubridate::ymd(start_date_chr)))
         ),
         TRUE ~ NA_character_
       ),
-      {{ id_col }} := str_replace(.data[[id_col]], "CCS-PCS", "CCS")
-    )
+      feature_id_clean = stringr::str_replace(.data[[id_col]], "CCS-PCS", "CCS")
+    ) %>%
+    dplyr::select(patient_num, year, feature_id = feature_id_clean)
+}
+
+clean_labels <- function(df) {
+  req <- c("patient_num", "label")
+  miss <- setdiff(req, names(df))
+  if (length(miss) > 0) stop("labels file missing required columns: ", paste(miss, collapse = ", "))
   
   df %>%
-    select(patient_num, year, {{ id_col }})
+    dplyr::transmute(
+      patient_num = as.character(patient_num),
+      label = as.integer(label)
+    )
 }
 
 clean_data <- function(paths, date_col = "start_date", id_col = "feature_id") {
-  input_data <- lapply(paths, read.csv)
-  cleaned <- lapply(input_data, clean_raw_data, date_col = date_col, id_col = id_col)
-  names(cleaned) <- names(paths)
-  return(cleaned)
+  if (is.null(names(paths)) || any(names(paths) == "")) {
+    stop("`paths` must be a *named* list (e.g., paths$codified1, paths$nlp1, optional paths$labels).")
+  }
+  
+  # Read everything except optional labels
+  paths_main <- paths[names(paths) != "labels"]
+  input_main <- lapply(paths_main, read.csv, stringsAsFactors = FALSE)
+  cleaned_main <- lapply(input_main, clean_raw_data, date_col = date_col, id_col = id_col)
+  names(cleaned_main) <- names(paths_main)
+  
+  # If labels path is provided AND exists, read + clean and attach
+  if (!is.null(paths$labels) && is.character(paths$labels) && length(paths$labels) == 1 &&
+      nzchar(paths$labels) && file.exists(paths$labels)) {
+    labels_df <- read.csv(paths$labels, stringsAsFactors = FALSE)
+    cleaned_main$labels <- clean_labels(labels_df)
+  }
+  
+  return(cleaned_main)
 }
 
 clean_dictionary <- function(dictionary_path) {
@@ -916,7 +940,6 @@ plot_related_code_trends_v2 <- function(Type, target_code, target_cui, codified_
     return(list(NULL, paste("No features found to plot for", Type)))
   }
   
-  # --- ALWAYS define descriptions (prevents your 'not found' error) ---
   descriptions <- dict %>%
     dplyr::filter(feature_id %in% selected_features) %>%
     dplyr::distinct(feature_id, description, target_similarity) %>%
@@ -1094,3 +1117,266 @@ plot_related_features <- function(data_inputs, target_code, target_cui, sample_l
   return(plot_results)
 }
 
+# ----------------------- MODULE 6 HELPERS -----------------------
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(scales)
+  library(pROC)
+})
+
+# Confusion-matrix metrics
+compute_conf_metrics <- function(truth, pred, positive = 1) {
+  truth <- as.integer(truth)
+  pred  <- as.integer(pred)
+  
+  TP <- sum(truth == positive & pred == positive, na.rm = TRUE)
+  TN <- sum(truth != positive & pred != positive, na.rm = TRUE)
+  FP <- sum(truth != positive & pred == positive, na.rm = TRUE)
+  FN <- sum(truth == positive & pred != positive, na.rm = TRUE)
+  
+  sensitivity <- ifelse((TP + FN) == 0, NA_real_, TP / (TP + FN))
+  specificity <- ifelse((TN + FP) == 0, NA_real_, TN / (TN + FP))
+  ppv         <- ifelse((TP + FP) == 0, NA_real_, TP / (TP + FP))
+  npv         <- ifelse((TN + FN) == 0, NA_real_, TN / (TN + FN))
+  accuracy    <- ifelse((TP + TN + FP + FN) == 0, NA_real_, (TP + TN) / (TP + TN + FP + FN))
+  
+  tibble(
+    TP = TP, TN = TN, FP = FP, FN = FN,
+    sensitivity = sensitivity,
+    specificity = specificity,
+    ppv = ppv,
+    npv = npv,
+    accuracy = accuracy
+  )
+}
+
+# ROC plot (theme + palette)
+plot_roc_module6 <- function(roc_obj, title_text) {
+  if (is.null(roc_obj)) return(NULL)
+  
+  coords_df <- pROC::coords(
+    roc_obj, "all",
+    ret = c("specificity", "sensitivity"),
+    transpose = FALSE
+  )
+  
+  roc_df <- tibble(
+    FPR = 1 - coords_df[, "specificity"],
+    TPR = coords_df[, "sensitivity"]
+  )
+  
+  auc_val <- as.numeric(pROC::auc(roc_obj))
+  
+  ggplot(roc_df, aes(x = FPR, y = TPR)) +
+    geom_line(aes(color = "ROC"), size = 1.2) +
+    geom_abline(linetype = "dashed") +
+    labs(
+      title = title_text,
+      subtitle = paste0("AUC = ", round(auc_val, 3)),
+      x = "False Positive Rate",
+      y = "True Positive Rate",
+      color = ""
+    ) +
+    theme_global + set_palette
+}
+
+# Metrics bar plot (Sens/Spec/PPV/NPV)
+plot_metrics_module6 <- function(metrics_row, title_text) {
+  metrics_long <- metrics_row %>%
+    select(sensitivity, specificity, ppv, npv) %>%
+    pivot_longer(everything(), names_to = "Metric", values_to = "Value") %>%
+    mutate(
+      Metric = factor(
+        Metric,
+        levels = c("sensitivity", "specificity", "ppv", "npv"),
+        labels = c("Sensitivity", "Specificity", "PPV", "NPV")
+      )
+    )
+  
+  ggplot(metrics_long, aes(x = Metric, y = Value, fill = Metric)) +
+    geom_col(width = 0.6) +
+    geom_text(
+      aes(label = ifelse(is.na(Value), "NA", scales::percent(Value, accuracy = 0.1))),
+      vjust = -0.35,
+      size = 4
+    ) +
+    scale_y_continuous(
+      labels = scales::percent_format(accuracy = 1),
+      limits = c(0, 1)
+    ) +
+    labs(
+      title = title_text,
+      x = "",
+      y = "Performance"
+    ) +
+    theme_global + set_fill_palette
+}
+
+# Confusion matrix tile plot
+plot_confusion_module6 <- function(conf_row, title_text) {
+  cm_df <- tibble(
+    Truth = rep(c("Positive", "Negative"), each = 2),
+    Predicted = rep(c("Positive", "Negative"), times = 2),
+    Count = c(conf_row$TP, conf_row$FN, conf_row$FP, conf_row$TN),
+    Cell = c("TP", "FN", "FP", "TN")
+  )
+  
+  ggplot(cm_df, aes(x = Predicted, y = Truth, fill = Count)) +
+    geom_tile(color = "white") +
+    geom_text(aes(label = Count), size = 6) +
+    labs(
+      title = title_text,
+      x = "Predicted",
+      y = "True"
+    ) +
+    theme_global + set_palette
+}
+
+# Main Module 6 function
+#
+# Evaluates labels against:
+#   - ref_code: patient has >=1 target_code in codified{sample}
+#   - ref_cui:  patient has >=1 target_cui  in nlp{sample}
+#   - ref_both: patient has both
+# Notes: Accepts binary labels (0/1). If you later use probabilities (0-1),
+#   AUC/ROC remains valid; metrics use threshold (default 0.5).
+# - Includes patients from labels OR codified OR nlp in the evaluation universe.
+evaluate_labels_module6 <- function(data_inputs,
+                                    target_code,
+                                    target_cui,
+                                    sample = "1",
+                                    positive_label = 1,
+                                    threshold = 0.5) {
+  
+  # ---- checks ----
+  if (is.null(data_inputs$labels)) {
+    stop("Module 6: data_inputs$labels not found. Provide labels via paths$labels or create them before Module 6.")
+  }
+  
+  codified_name <- paste0("codified", sample)
+  nlp_name      <- paste0("nlp", sample)
+  
+  if (is.null(data_inputs[[codified_name]])) stop("Module 6: Missing ", codified_name, " in data_inputs.")
+  if (is.null(data_inputs[[nlp_name]]))      stop("Module 6: Missing ", nlp_name, " in data_inputs.")
+  
+  cod_df <- data_inputs[[codified_name]] %>% distinct(patient_num, feature_id)
+  nlp_df <- data_inputs[[nlp_name]] %>% distinct(patient_num, feature_id)
+  
+  labels_df <- data_inputs$labels %>%
+    transmute(
+      patient_num = as.character(patient_num),
+      label = as.numeric(label)
+    ) %>%
+    distinct(patient_num, .keep_all = TRUE)
+  
+  # ---- reference indicators ----
+  ref_code <- cod_df %>%
+    filter(feature_id %in% target_code) %>%
+    distinct(patient_num) %>%
+    mutate(ref_code = 1L)
+  
+  ref_cui <- nlp_df %>%
+    filter(feature_id %in% target_cui) %>%
+    distinct(patient_num) %>%
+    mutate(ref_cui = 1L)
+  
+  all_patients <- tibble(
+    patient_num = unique(c(
+      as.character(cod_df$patient_num),
+      as.character(nlp_df$patient_num),
+      as.character(labels_df$patient_num)
+    ))
+  )
+  
+  eval_df <- all_patients %>%
+    left_join(ref_code, by = "patient_num") %>%
+    left_join(ref_cui,  by = "patient_num") %>%
+    left_join(labels_df, by = "patient_num") %>%
+    mutate(
+      ref_code = ifelse(is.na(ref_code), 0L, ref_code),
+      ref_cui  = ifelse(is.na(ref_cui),  0L, ref_cui),
+      ref_both = as.integer(ref_code == 1L & ref_cui == 1L),
+      label    = ifelse(is.na(label), 0, label),
+      label_bin = as.integer(label >= threshold)
+    )
+  
+  # ---- evaluator for a single reference ----
+  eval_one <- function(truth_vec, label_score, label_bin, ref_name) {
+    truth_vec <- as.integer(truth_vec)
+    
+    # ROC/AUC (works with binary or continuous predictor)
+    roc_obj <- try(pROC::roc(truth_vec, label_score, quiet = TRUE), silent = TRUE)
+    if (inherits(roc_obj, "try-error")) roc_obj <- NULL
+    
+    conf <- compute_conf_metrics(truth_vec, label_bin, positive = positive_label)
+    
+    metrics <- conf %>%
+      mutate(
+        AUC = ifelse(is.null(roc_obj), NA_real_, as.numeric(pROC::auc(roc_obj))),
+        n_pos = sum(truth_vec == 1L, na.rm = TRUE),
+        n_neg = sum(truth_vec == 0L, na.rm = TRUE),
+        Reference = ref_name
+      ) %>%
+      select(Reference, n_pos, n_neg, AUC, sensitivity, specificity, ppv, npv, accuracy, TP, TN, FP, FN)
+    
+    plots <- list(
+      roc_plot = plot_roc_module6(roc_obj, paste0("ROC vs ", ref_name)),
+      metrics_plot = plot_metrics_module6(metrics, paste0("Metrics vs ", ref_name)),
+      confusion_plot = plot_confusion_module6(conf, paste0("Confusion vs ", ref_name))
+    )
+    
+    list(metrics = metrics, roc = roc_obj, confusion = conf, plots = plots)
+  }
+  
+  res_code <- eval_one(eval_df$ref_code, eval_df$label, eval_df$label_bin, "Target Code")
+  res_cui  <- eval_one(eval_df$ref_cui,  eval_df$label, eval_df$label_bin, "Target CUI")
+  res_both <- eval_one(eval_df$ref_both, eval_df$label, eval_df$label_bin, "Code + CUI")
+  
+  list(
+    metrics_table = bind_rows(res_code$metrics, res_cui$metrics, res_both$metrics),
+    plots = list(
+      code = res_code$plots,
+      cui  = res_cui$plots,
+      both = res_both$plots
+    ),
+    eval_dataframe = eval_df
+  )
+}
+
+# Pretty metrics table for Module 6
+print_module6_table <- function(results_module6,
+                                caption = "Module 6: Label Performance vs Target Code and CUI") {
+  
+  if (is.null(results_module6$metrics_table)) {
+    stop("metrics_table not found in results_module6.")
+  }
+  
+  metrics_display <- results_module6$metrics_table %>%
+    dplyr::mutate(
+      AUC = round(AUC, 3),
+      Sensitivity = scales::percent(sensitivity, accuracy = 0.1),
+      Specificity = scales::percent(specificity, accuracy = 0.1),
+      PPV = scales::percent(ppv, accuracy = 0.1),
+      NPV = scales::percent(npv, accuracy = 0.1),
+      Accuracy = scales::percent(accuracy, accuracy = 0.1)
+    ) %>%
+    dplyr::select(
+      Reference,
+      `N Positive` = n_pos,
+      `N Negative` = n_neg,
+      AUC,
+      Sensitivity,
+      Specificity,
+      PPV,
+      NPV,
+      Accuracy, TP, TN, FP, FN
+    )
+  
+  knitr::kable(
+    metrics_display,
+    caption = caption
+  )
+}

@@ -15,8 +15,9 @@ The modules are organized as follows:
 - **Module 3**: Trends for selected phenotypes
 - **Module 4**: Trends and correlation for target code-CUI pair
 - **Module 5**: ONCE feature trends (e.g., diagnoses, medications, labs, procedures)
+- **Module 6**: Phenotype label validation
 
-Once **Module 1** (data preparation) is complete, **Modules 2-5** can be run independently, in any order.
+Once **Module 1** (data preparation) is complete, **Modules 2-6** can be run independently, in any order.
 
 ---
 
@@ -29,8 +30,10 @@ For each sample, you must provide the following:
 1. A codified dataset
 2. An NLP dataset
 3. A data dictionary describing all codified and NLP features
+4. (**Module 5** only) A feature similarity dictionary from the ONCE webapp
+5. (**Module 6** only) A patient-level labels dataset
 
-To run **Module 5**, you will also need a feature similarity dictionary from the ONCE webapp. Details for each required file type are below.
+Details for each required file type are below.
 
 ### *Codified \& NLP Data*
 
@@ -73,6 +76,28 @@ To run **Module 5**, you must provide a ONCE-derived feature similarity dictiona
 4. Provide manual file paths to:
     - ONCE codified dictionary
     - ONCE NLP dictionary
+    
+### *Phenotype Labels*
+
+To run **Module 6**, you must provide a patient-level labels dataset. This file contains the phenotype label assigned to each patient and is evaluated against codified and NLP-derived evidence of the target concept. This dataset must contain exactly **one row per patient** and include the following columns:
+
+- `patient_num`: Unique patient identifier (must match the identifier used in codified and NLP datasets)
+- `label`: Binary phenotype indicator (0 = negative, 1 = positive)
+
+The label column may represent:
+
+- A rule-based phenotype definition
+- A weakly supervised (silver) label
+- A manually curated (gold-standard) label
+- A model-derived prediction thresholded to 0/1
+
+If probabilistic scores (e.g., values between 0 and 1) are provided instead of binary labels, the pipeline will compute AUC using the continuous scores and apply a classification threshold (default = 0.5) for confusion-matrix metrics. Below is an example of a correctly formatted label dataset:
+
+| `patient_num`| `label`     |
+|--------------|-------------|
+| Patient1     |      1      |
+| Patient2     |      0      |
+| Patient3     |      1      |
 
 ---
 
@@ -135,6 +160,11 @@ O2 <- FALSE
 manual_ONCE_path_code <- "../Data/ONCE_multiple_sclerosis_codified.csv"
 manual_ONCE_path_nlp <- "../Data/ONCE_multiple_sclerosis_nlp.csv"
 
+# ----------------------- LABEL QC (MODULE 6 ONLY) -----------------------
+
+# Label file with patient ID and binary label
+paths$labels <- "../Data/labels.csv"
+
 ```
 
 ---
@@ -165,12 +195,12 @@ data_inputs <- clean_data(paths)
   # data_inputs$nlp1
   # data_inputs$codified2
   # data_inputs$nlp2
+  # data_inputs$labels
 
 # Load and clean dictionary
 dictionary <- clean_dictionary(dictionary_path)
 
 ```
-
 ---
 
 ## Module 2: Target Code and CUI Prevalence
@@ -353,3 +383,57 @@ for (res in results_module5) {
 
 ```
 
+---
+
+## Module 6: Phenotype Label Validation
+
+This module evaluates the provided **patient-level labels** against structured and NLP-derived evidence of the target phenotype. Labels are compared to three reference definitions derived from the cleaned datasets in Module 1:
+
+1. **Target Code**: Patient has ≥1 occurrence of the specified `target_code` in the codified dataset
+2. **Target CUI**: Patient has ≥1 occurrence of the specified `target_cui` in the NLP dataset
+3. **Code + CUI**: Patient has ≥1 occurrence of both the target code *and* the target CUI
+
+For each reference definition, the module quantifies concordance between labels and EHR evidence using standard classification metrics and visual diagnostics. This is intended as a QC check: discrepancies may reflect label construction errors, incomplete code rollups, NLP extraction gaps, or phenotype definition differences.
+
+#### *Inputs*
+
+1. `data_inputs`: Cleaned codified and NLP datasets from Module 1
+3. `target_code`: Target code(s) of interest (e.g., `"PheCode:335"`)
+4. `target_cui`: Target CUI(s) of interest (e.g., `"C0026769"`)
+5. `sample`: Sample identifier used to select datasets (default `"1"`)
+6. `threshold`: Classification threshold applied to labels when computing confusion-matrix metrics (default `0.5`)
+
+#### *Outputs*
+
+1. `metrics_table`: A summary table reporting, for each reference definition (Code, CUI, Code + CUI):
+   * Number of EHR-defined positives and negatives
+   * Confusion matrix counts (TP, TN, FP, FN)
+   * AUC, sensitivity, specificity, PPV, NPV, and accuracy of the phenotype labels relative to the EHR-derived reference definition
+2. `roc_plot`: ROC curve visualization (one per reference definition) summarizing discriminative performance (AUC)
+3. `metrics_plot`: Bar plot summarizing Sensitivity, Specificity, PPV, and NPV (one per reference definition)
+4. `confusion_plot`: Confusion matrix heatmap summarizing true/false positives and negatives (one per reference definition)
+5. `eval_dataframe`: Patient-level joined dataset used for evaluation (labels + reference indicators), useful for debugging mismatches
+
+```{r module6}
+
+# Generate module 6 results
+results_module6 <- evaluate_labels_module6(
+  data_inputs = data_inputs,
+  target_code = target_code,
+  target_cui  = target_cui,
+  sample = "1"
+)
+
+# Display table and plots
+print_module6_table(results_module6)
+
+for (ref in names(results_module6$plots)) {
+  print(results_module6$plots[[ref]]$roc_plot)
+  print(results_module6$plots[[ref]]$metrics_plot)
+  print(results_module6$plots[[ref]]$confusion_plot)
+}
+
+# Optional: review mismatches
+# results_module6$eval_dataframe
+
+```
