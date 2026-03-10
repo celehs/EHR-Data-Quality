@@ -387,32 +387,40 @@ for (res in results_module5) {
 
 ## Module 6: Phenotype Label Validation
 
-This module evaluates the provided **patient-level labels** against structured and NLP-derived evidence of the target phenotype. Labels are compared to three reference definitions derived from the cleaned datasets in Module 1:
+This module evaluates the concordance between **patient-level phenotype labels (treated as the reference truth)** and EHR-derived evidence of the target phenotype (treated as predictions). Specifically, structured codified codes and NLP-derived CUIs are used as phenotype indicators and compared against the provided labels.
+
+Three EHR-based prediction definitions are evaluated:
 
 1. **Target Code**: Patient has ≥1 occurrence of the specified `target_code` in the codified dataset
 2. **Target CUI**: Patient has ≥1 occurrence of the specified `target_cui` in the NLP dataset
 3. **Code + CUI**: Patient has ≥1 occurrence of both the target code *and* the target CUI
 
-For each reference definition, the module quantifies concordance between labels and EHR evidence using standard classification metrics and visual diagnostics. This is intended as a QC check: discrepancies may reflect label construction errors, incomplete code rollups, NLP extraction gaps, or phenotype definition differences.
+For each definition, the module assesses how well EHR-derived phenotype indicators recover the provided labels using standard classification metrics and visual diagnostics. This module is intended as a QC assessment; discrepancies between labels and EHR evidence may reflect:
 
-#### *Inputs*
+* Label construction or thresholding errors
+* Incomplete code rollups
+* NLP extraction gaps
+* Temporal misalignment
+* Differences in phenotype definition
 
-1. `data_inputs`: Cleaned codified and NLP datasets from Module 1
-3. `target_code`: Target code(s) of interest (e.g., `"PheCode:335"`)
-4. `target_cui`: Target CUI(s) of interest (e.g., `"C0026769"`)
-5. `sample`: Sample identifier used to select datasets (default `"1"`)
-6. `threshold`: Classification threshold applied to labels when computing confusion-matrix metrics (default `0.5`)
+### *Inputs*
 
-#### *Outputs*
+1. `data_inputs`: Cleaned codified and NLP datasets from Module 1 (must include `data_inputs$labels`)
+2. `target_code`: Target code(s) of interest (e.g., `"PheCode:335"` or a vector of codes)
+3. `target_cui`: Target CUI(s) of interest (e.g., `"C0026769"` or a vector of CUIs)
+4. `sample`: Sample identifier used to select datasets (default `"1"`)
+5. `threshold`: Classification threshold applied to labels when computing confusion-matrix metrics (default `0.5`)
 
-1. `metrics_table`: A summary table reporting, for each reference definition (Code, CUI, Code + CUI):
-   * Number of EHR-defined positives and negatives
+### *Outputs*
+
+1. `metrics_table`: A summary table reporting, for each EHR-based prediction definition (Code, CUI, Code + CUI):
+   * Number of EHR-derived positive and negative phenotypes
+   * AUC, sensitivity, specificity, PPV, NPV, and accuracy of the EHR-derived phenotype indicators relative to the truth
    * Confusion matrix counts (TP, TN, FP, FN)
-   * AUC, sensitivity, specificity, PPV, NPV, and accuracy of the phenotype labels relative to the EHR-derived reference definition
-2. `roc_plot`: ROC curve visualization (one per reference definition) summarizing discriminative performance (AUC)
-3. `metrics_plot`: Bar plot summarizing Sensitivity, Specificity, PPV, and NPV (one per reference definition)
-4. `confusion_plot`: Confusion matrix heatmap summarizing true/false positives and negatives (one per reference definition)
-5. `eval_dataframe`: Patient-level joined dataset used for evaluation (labels + reference indicators), useful for debugging mismatches
+2. `roc_plot`: ROC curve (one per reference definition) showing how well the EHR-derived indicator discriminates between label-positive and label-negative patients
+3. `metrics_plot`: Bar plot summarizing sensitivity, specificity, PPV, and NPV for each EHR definition
+4. `confusion_plot`: Confusion matrix heatmap summarizing agreement and disagreement between labels (truth) and EHR-derived predictions
+5. `eval_dataframe`: Patient-level evaluation dataset containing labels and EHR-based prediction indicators, useful for debugging mismatches
 
 ```{r module6}
 
@@ -421,7 +429,8 @@ results_module6 <- evaluate_labels_module6(
   data_inputs = data_inputs,
   target_code = target_code,
   target_cui  = target_cui,
-  sample = "1"
+  sample = "1",
+  threshold = 0.5
 )
 
 # Display table and plots

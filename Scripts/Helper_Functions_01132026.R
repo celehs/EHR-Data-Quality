@@ -3,7 +3,8 @@
 
 required_packages <- c(
   "dplyr", "stringr", "tidyr", "ggplot2", "gridExtra", 
-  "ggtext", "knitr", "lubridate", "cowplot", "RColorBrewer", "purrr"
+  "ggtext", "knitr", "lubridate", "cowplot", "RColorBrewer", "purrr", 
+  "scales", "pROC", "kableExtra"
 )
 
 # Install any packages that are missing
@@ -1125,9 +1126,12 @@ suppressPackageStartupMessages({
   library(ggplot2)
   library(scales)
   library(pROC)
+  library(knitr)
 })
 
+# -------------------------
 # Confusion-matrix metrics
+# -------------------------
 compute_conf_metrics <- function(truth, pred, positive = 1) {
   truth <- as.integer(truth)
   pred  <- as.integer(pred)
@@ -1153,7 +1157,9 @@ compute_conf_metrics <- function(truth, pred, positive = 1) {
   )
 }
 
+# -------------------------
 # ROC plot (theme + palette)
+# -------------------------
 plot_roc_module6 <- function(roc_obj, title_text) {
   if (is.null(roc_obj)) return(NULL)
   
@@ -1183,7 +1189,9 @@ plot_roc_module6 <- function(roc_obj, title_text) {
     theme_global + set_palette
 }
 
+# ------------------------------------
 # Metrics bar plot (Sens/Spec/PPV/NPV)
+# ------------------------------------
 plot_metrics_module6 <- function(metrics_row, title_text) {
   metrics_long <- metrics_row %>%
     select(sensitivity, specificity, ppv, npv) %>%
@@ -1215,7 +1223,9 @@ plot_metrics_module6 <- function(metrics_row, title_text) {
     theme_global + set_fill_palette
 }
 
+# -------------------------
 # Confusion matrix tile plot
+# -------------------------
 plot_confusion_module6 <- function(conf_row, title_text) {
   cm_df <- tibble(
     Truth = rep(c("Positive", "Negative"), each = 2),
@@ -1224,26 +1234,24 @@ plot_confusion_module6 <- function(conf_row, title_text) {
     Cell = c("TP", "FN", "FP", "TN")
   )
   
+  # Use readable single-color gradient (high color chosen to harmonize with Set2)
   ggplot(cm_df, aes(x = Predicted, y = Truth, fill = Count)) +
     geom_tile(color = "white") +
     geom_text(aes(label = Count), size = 6) +
+    scale_fill_gradient(low = "white", high = "#2b6ca3") +
     labs(
       title = title_text,
       x = "Predicted",
       y = "True"
     ) +
-    theme_global + set_palette
+    theme_global
 }
 
-# Main Module 6 function
-#
-# Evaluates labels against:
-#   - ref_code: patient has >=1 target_code in codified{sample}
-#   - ref_cui:  patient has >=1 target_cui  in nlp{sample}
-#   - ref_both: patient has both
-# Notes: Accepts binary labels (0/1). If you later use probabilities (0-1),
-#   AUC/ROC remains valid; metrics use threshold (default 0.5).
-# - Includes patients from labels OR codified OR nlp in the evaluation universe.
+# ============================================================
+# Main Module 6 function 
+# - TRUTH = labels (label column)
+# - PREDICTION = EHR-derived indicators (code, CUI, both)
+# ============================================================
 evaluate_labels_module6 <- function(data_inputs,
                                     target_code,
                                     target_cui,
@@ -1265,6 +1273,7 @@ evaluate_labels_module6 <- function(data_inputs,
   cod_df <- data_inputs[[codified_name]] %>% distinct(patient_num, feature_id)
   nlp_df <- data_inputs[[nlp_name]] %>% distinct(patient_num, feature_id)
   
+  # labels = TRUTH (can be 0/1 or continuous score)
   labels_df <- data_inputs$labels %>%
     transmute(
       patient_num = as.character(patient_num),
@@ -1272,17 +1281,18 @@ evaluate_labels_module6 <- function(data_inputs,
     ) %>%
     distinct(patient_num, .keep_all = TRUE)
   
-  # ---- reference indicators ----
-  ref_code <- cod_df %>%
+  # ---- EHR indicators = PREDICTIONS ----
+  pred_code <- cod_df %>%
     filter(feature_id %in% target_code) %>%
     distinct(patient_num) %>%
-    mutate(ref_code = 1L)
+    mutate(pred_code = 1L)
   
-  ref_cui <- nlp_df %>%
+  pred_cui <- nlp_df %>%
     filter(feature_id %in% target_cui) %>%
     distinct(patient_num) %>%
-    mutate(ref_cui = 1L)
+    mutate(pred_cui = 1L)
   
+  # evaluation universe: anyone present in labels OR codified OR nlp
   all_patients <- tibble(
     patient_num = unique(c(
       as.character(cod_df$patient_num),
@@ -1292,26 +1302,36 @@ evaluate_labels_module6 <- function(data_inputs,
   )
   
   eval_df <- all_patients %>%
-    left_join(ref_code, by = "patient_num") %>%
-    left_join(ref_cui,  by = "patient_num") %>%
+    left_join(pred_code, by = "patient_num") %>%
+    left_join(pred_cui,  by = "patient_num") %>%
     left_join(labels_df, by = "patient_num") %>%
     mutate(
-      ref_code = ifelse(is.na(ref_code), 0L, ref_code),
-      ref_cui  = ifelse(is.na(ref_cui),  0L, ref_cui),
-      ref_both = as.integer(ref_code == 1L & ref_cui == 1L),
-      label    = ifelse(is.na(label), 0, label),
-      label_bin = as.integer(label >= threshold)
+      pred_code = ifelse(is.na(pred_code), 0L, pred_code),
+      pred_cui  = ifelse(is.na(pred_cui),  0L, pred_cui),
+      pred_both = as.integer(pred_code == 1L & pred_cui == 1L),
+      
+      # Truth label (binary for confusion-matrix metrics); if labels are missing assume 0
+      label = ifelse(is.na(label), 0, label),
+      truth_label = as.integer(label >= threshold),
+      
+      # For ROC, we use the EHR indicator as the predictor (numeric 0/1).
+      pred_code_num = as.numeric(pred_code),
+      pred_cui_num  = as.numeric(pred_cui),
+      pred_both_num = as.numeric(pred_both)
     )
   
-  # ---- evaluator for a single reference ----
-  eval_one <- function(truth_vec, label_score, label_bin, ref_name) {
-    truth_vec <- as.integer(truth_vec)
+  # ---- evaluator: TRUTH = labels, PRED = EHR indicator ----
+  eval_one <- function(truth_vec, pred_score, pred_bin, ref_name) {
+    truth_vec <- as.integer(truth_vec)    # labels
+    pred_score <- as.numeric(pred_score)  # for ROC (0/1 currently)
+    pred_bin <- as.integer(pred_bin)      # for confusion metrics
     
-    # ROC/AUC (works with binary or continuous predictor)
-    roc_obj <- try(pROC::roc(truth_vec, label_score, quiet = TRUE), silent = TRUE)
+    # ROC/AUC (EHR indicator as predictor of label truth)
+    roc_obj <- try(pROC::roc(truth_vec, pred_score, quiet = TRUE), silent = TRUE)
     if (inherits(roc_obj, "try-error")) roc_obj <- NULL
     
-    conf <- compute_conf_metrics(truth_vec, label_bin, positive = positive_label)
+    # Confusion metrics: truth = label, pred = EHR binary indicator
+    conf <- compute_conf_metrics(truth_vec, pred_bin, positive = positive_label)
     
     metrics <- conf %>%
       mutate(
@@ -1323,38 +1343,78 @@ evaluate_labels_module6 <- function(data_inputs,
       select(Reference, n_pos, n_neg, AUC, sensitivity, specificity, ppv, npv, accuracy, TP, TN, FP, FN)
     
     plots <- list(
-      roc_plot = plot_roc_module6(roc_obj, paste0("ROC vs ", ref_name)),
-      metrics_plot = plot_metrics_module6(metrics, paste0("Metrics vs ", ref_name)),
-      confusion_plot = plot_confusion_module6(conf, paste0("Confusion vs ", ref_name))
+      roc_plot = plot_roc_module6(roc_obj, paste0("ROC: EHR → Label (", ref_name, ")")),
+      metrics_plot = plot_metrics_module6(metrics, paste0("Metrics: EHR → Label (", ref_name, ")")),
+      confusion_plot = plot_confusion_module6(conf, paste0("Confusion: EHR → Label (", ref_name, ")"))
     )
     
     list(metrics = metrics, roc = roc_obj, confusion = conf, plots = plots)
   }
   
-  res_code <- eval_one(eval_df$ref_code, eval_df$label, eval_df$label_bin, "Target Code")
-  res_cui  <- eval_one(eval_df$ref_cui,  eval_df$label, eval_df$label_bin, "Target CUI")
-  res_both <- eval_one(eval_df$ref_both, eval_df$label, eval_df$label_bin, "Code + CUI")
+  res_code <- eval_one(eval_df$truth_label, eval_df$pred_code_num, eval_df$pred_code, "Target Code")
+  res_cui  <- eval_one(eval_df$truth_label, eval_df$pred_cui_num,  eval_df$pred_cui,  "Target CUI")
+  res_both <- eval_one(eval_df$truth_label, eval_df$pred_both_num, eval_df$pred_both, "Code + CUI")
   
   list(
     metrics_table = bind_rows(res_code$metrics, res_cui$metrics, res_both$metrics),
-    plots = list(
-      code = res_code$plots,
-      cui  = res_cui$plots,
-      both = res_both$plots
-    ),
+    plots = list(code = res_code$plots, cui = res_cui$plots, both = res_both$plots),
     eval_dataframe = eval_df
   )
 }
-
+# ------------------------------------------------------------
 # Pretty metrics table for Module 6
+# - Prints label counts once (truth)
+# - Table includes EHR-positive counts per reference
+# ------------------------------------------------------------
 print_module6_table <- function(results_module6,
-                                caption = "Module 6: Label Performance vs Target Code and CUI") {
+                                caption = "Module 6: EHR-derived Predictions vs. Label Truth") {
   
   if (is.null(results_module6$metrics_table)) {
     stop("metrics_table not found in results_module6.")
   }
+  if (is.null(results_module6$eval_dataframe)) {
+    stop("eval_dataframe not found in results_module6. Ensure evaluate_labels_module6 returns eval_dataframe.")
+  }
   
+  edf <- results_module6$eval_dataframe
+  
+  # ---- Print label counts once (truth) ----
+  n_label_1 <- sum(edf$truth_label == 1, na.rm = TRUE)
+  n_label_0 <- sum(edf$truth_label == 0, na.rm = TRUE)
+  n_total   <- sum(!is.na(edf$truth_label))
+  
+  cat("Label distribution (truth): ",
+      "N(Label = 1) = ", n_label_1, "; ",
+      "N(Label = 0) = ", n_label_0, "; ",
+      "Total = ", n_total, "\n\n", sep = "")
+  
+  label_summary <- tibble(
+    `Label = 1` = n_label_1,
+    `Label = 0` = n_label_0,
+    `Total` = n_total
+  )
+  
+  knitr::kable(label_summary, align = "c") %>%
+    kableExtra::kable_styling(
+      full_width = FALSE,
+      position = "left",
+      bootstrap_options = c("striped", "condensed")
+    )
+  
+  # ---- EHR-positive counts per reference (predictions) ----
+  ehr_counts <- tibble(
+    Reference = c("Target Code", "Target CUI", "Code + CUI"),
+    `N (EHR = 1)` = c(sum(edf$pred_code == 1, na.rm = TRUE),
+                      sum(edf$pred_cui  == 1, na.rm = TRUE),
+                      sum(edf$pred_both == 1, na.rm = TRUE)),
+    `N (EHR = 0)` = c(sum(edf$pred_code == 0, na.rm = TRUE),
+                      sum(edf$pred_cui  == 0, na.rm = TRUE),
+                      sum(edf$pred_both == 0, na.rm = TRUE))
+  )
+  
+  # ---- Format metrics + merge counts ----
   metrics_display <- results_module6$metrics_table %>%
+    dplyr::left_join(ehr_counts, by = "Reference") %>%
     dplyr::mutate(
       AUC = round(AUC, 3),
       Sensitivity = scales::percent(sensitivity, accuracy = 0.1),
@@ -1365,14 +1425,15 @@ print_module6_table <- function(results_module6,
     ) %>%
     dplyr::select(
       Reference,
-      `N Positive` = n_pos,
-      `N Negative` = n_neg,
+      `N (EHR = 1)`,
+      `N (EHR = 0)`,
       AUC,
       Sensitivity,
       Specificity,
       PPV,
       NPV,
-      Accuracy, TP, TN, FP, FN
+      Accuracy,
+      TP, TN, FP, FN
     )
   
   knitr::kable(
